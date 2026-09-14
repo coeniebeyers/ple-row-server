@@ -125,12 +125,17 @@ exists to avoid.
 
 ## Phase 0 results
 
-Both halves exported and size-verified:
+Both halves exported, size-verified, and checksum-verified against the source:
 
-| | rows | bytes | time | rate |
-|---|---|---|---|---|
-| node1 | 0 .. 160,000,768 | 25,600,122,880 | 146 s | 175 MB/s |
-| node2 | 160,000,768 .. 320,001,536 | 25,600,122,880 | 151 s | 169 MB/s |
+| | rows | bytes | time | rate | sha256 |
+|---|---|---|---|---|---|
+| node1 | 0 .. 160,000,768 | 25,600,122,880 | 146 s | 175 MB/s | `2fadd978812cb671...` ✅ |
+| node2 | 160,000,768 .. 320,001,536 | 25,600,122,880 | 151 s | 169 MB/s | `78e0df7f21d0e2a1...` ✅ |
+
+Each half matched the source across all 382 blocks of 64 MiB, digested independently
+on the peer and on the source box. node2's match is the one that carries weight: all
+four out-of-order shards fall in its range, so it is the end-to-end proof that the
+permutation is handled, rather than just the unit check above.
 
 The peers are on 2.5 GbE, so 175 MB/s is about 62% of the wire. During the export
 the source NVMe sat at about 10% utilisation with 0.06 ms read latency, so the disk
