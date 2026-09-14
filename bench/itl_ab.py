@@ -19,6 +19,7 @@ def measure(base, model, words, max_tokens, tag, seed):
                           "content": "Ignore this corpus.\n" + corpus
                                      + "\nCount slowly from 1 to 80, one number per line."}],
             "max_tokens": max_tokens, "temperature": 0, "stream": True,
+            "stream_options": {"include_usage": True},
             "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(base + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),
@@ -26,25 +27,39 @@ def measure(base, model, words, max_tokens, tag, seed):
     t0 = time.time()
     first = None
     prev = None
+    last = None
     gaps = []
+    completion = 0
     for raw in urllib.request.urlopen(req, timeout=1800):
         line = raw.decode().strip()
         if not line.startswith("data: ") or line.endswith("[DONE]"):
             continue
-        chunk = json.loads(line[6:])["choices"][0].get("delta", {}).get("content")
+        payload = json.loads(line[6:])
+        # An SSE chunk is not a token. Several tokens arrive per chunk, so timing gaps
+        # between chunks overstates per-token latency by whatever the batching factor is.
+        # The usage record is the only honest token count.
+        if payload.get("usage"):
+            completion = payload["usage"].get("completion_tokens") or completion
+        if not payload.get("choices"):
+            continue
+        chunk = payload["choices"][0].get("delta", {}).get("content")
         if not chunk:
             continue
         now = time.time()
+        last = now
         if first is None:
             first = now - t0
         else:
             gaps.append((now - prev) * 1000.0)
         prev = now
     gaps.sort()
+    decode_s = (last - t0) - first if last and first else None
     return {"tag": tag, "ttft_s": first, "chunks": len(gaps) + 1,
-            "itl_p50": statistics.median(gaps) if gaps else None,
-            "itl_p90": gaps[int(len(gaps) * 0.9)] if gaps else None,
-            "itl_min": gaps[0] if gaps else None}
+            "completion_tokens": completion,
+            "decode_s": decode_s,
+            "tok_per_s": (completion / decode_s) if decode_s and completion else None,
+            "ms_per_token": (decode_s / completion * 1000.0) if decode_s and completion else None,
+            "chunk_gap_p50": statistics.median(gaps) if gaps else None}
 
 
 def main():
@@ -63,12 +78,12 @@ def main():
     for i in range(a.runs):
         r = measure(a.base_url, a.model, a.words, a.max_tokens, a.label, 4000 + i)
         rows.append(r)
-        print(f"  run {i + 1}  TTFT {r['ttft_s']:6.2f}s   ITL p50 {r['itl_p50']:6.1f}  "
-              f"p90 {r['itl_p90']:6.1f}  min {r['itl_min']:6.1f} ms   ({r['chunks']} chunks)")
-    p50s = [r["itl_p50"] for r in rows]
-    best = min(p50s)
-    print(f"  --> ITL p50 median-of-runs {statistics.median(p50s):.1f} ms, best {best:.1f} ms "
-          f"= {1000.0 / best:.1f} tok/s single stream")
+        print(f"  run {i + 1}  TTFT {r['ttft_s']:6.2f}s   {r['completion_tokens']:4d} tok in "
+              f"{r['decode_s']:6.2f}s = {r['tok_per_s']:5.1f} tok/s "
+              f"({r['ms_per_token']:5.1f} ms/token; {r['chunks']} chunks, "
+              f"gap p50 {r['chunk_gap_p50']:.0f} ms)")
+    rates = [r["tok_per_s"] for r in rows if r["tok_per_s"]]
+    print(f"  --> {statistics.median(rates):.1f} tok/s median of runs, best {max(rates):.1f}")
     if a.json:
         json.dump({"label": a.label, "runs": rows}, open(a.json, "w"), indent=2)
 
