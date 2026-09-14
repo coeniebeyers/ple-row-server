@@ -3,9 +3,11 @@
 Serve the Qwen3.8-Flash-Next per-layer embedding (PLE) n-gram table out of a peer
 machine's RAM, so the box running the model does not have to hold it.
 
-**Status: spike in progress.** Phase 0 (export and verify the table halves) is done.
-The row server itself is not built yet. Numbers below are from a design study plus
-Phase 0 measurements, and are marked as such. Nothing here is a finished result.
+**Status: working, not yet wired into vLLM.** The table is exported and checksum
+verified, both peers serve their half out of RAM, and the wire path is measured and
+verified byte for byte against the original checkpoint. What is left is the client
+side inside the model, as a `PLE_MODE=remote` sibling to the existing disk modes.
+See [Phase 1 results](#phase-1-results-2026-09-14) for measured numbers.
 
 ## The problem
 
@@ -51,25 +53,26 @@ the whole table, the load balances itself without any routing logic.
 
 ## What this is worth, honestly
 
-The payoff is **not** faster decode. A design study put decode at roughly +2%,
-which is noise. The two real wins are:
+Two wins, and it is worth being precise about which is which.
 
-1. **Prefill / time-to-first-token**, estimated around -21%. Gathering a prefill
-   chunk's rows over the network was measured at about 18.1 ms against about 7.08 ms
-   per decode step from disk, and the disk path's cost turns out to be syscall count
-   rather than I/O: it issues hundreds of small `preadv` calls per step. Network
-   gather beat even a *warm* page cache (about 4.7 ms) for that reason.
-2. **Giving the page cache back.** This is the one that motivated the work. It
-   removes the table from competition with the weights entirely.
+1. **Cold prefill, so time-to-first-token.** This is the big one. A gather is 12.6x
+   faster for a decode step and 26x faster for a prefill chunk than reading the same
+   rows from disk. On this box a cold 137k token prefill takes about 105 s and needs
+   2.2 million rows, which is roughly 21 s of disk gather; over the wire that is under
+   a second. Call it a fifth of cold TTFT.
+2. **Giving the page cache back.** This is what motivated the work. The table stops
+   competing with the memory-mapped weights for the inference box's page cache.
 
-Measured gather latency in the study was about 0.45 ms median and 1.17 ms at the
-99th percentile for an 8-sequence decode step, against an engine step of 66.9 to
-146.3 ms. That is 0.3% to 1.8% of a step, which is why it can be done synchronously
-without prefetching or hiding it behind compute.
+Decode gathers get faster too, but decode was never the problem: a gather is a small
+fraction of an engine step either way, so 12.6x on that fraction is not 12.6x on tokens
+per second. Do not expect a decode speedup from this.
 
-Those network numbers were taken with the inference box two switch hops from the
-peers. Moving it onto the same switch should improve them, mostly at the tail, so
-treat them as a pessimistic baseline rather than a best case.
+Cold prefill matters more than it looks, because anything that invalidates the prefix
+cache drops you onto this path. Context compaction in an agent session rewrites the
+context from the top, so the request after a compaction pays full cold prefill.
+
+All numbers were taken with the inference box two switch hops from the peers. Same
+switch should improve them, mostly at the tail, so treat them as a pessimistic baseline.
 
 ## Phase 0: exporting the table
 
