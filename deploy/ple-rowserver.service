@@ -1,0 +1,121 @@
+[Unit]
+Description=PLE row server (one half of the Qwen3.8-Flash-Next n-gram table)
+Documentation=file:///usr/local/share/ple-row-server/protocol.md
+After=network-online.target
+Wants=network-online.target
+# node1 carries the k3s embedded etcd. Ordering after it means a boot does not have
+# 23.842 GiB of page-cache warmup competing with etcd for the same NVMe while the
+# cluster is electing a leader. Ordering against a unit that is absent is a no-op,
+# so the same file works unchanged on node2.
+After=k3s.service k3s-agent.service
+
+# Three attempts inside ten minutes, then stay down. A node that is short on memory
+# does not get better by being handed a process that reads 23.842 GiB back in.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=coenie
+Group=coenie
+
+# Defaults first, then the per-node file, which wins where it sets the same name. An
+# unset variable would expand to nothing and shift the next flag into its place, so the
+# three that have a sensible default get one here. PLE_TABLE, PLE_BASE_ROW and
+# PLE_ROW_COUNT are per node and deliberately have none: without them rowserverd prints
+# its usage and exits 2.
+Environment=PLE_PORT=9000
+Environment=PLE_MAX_ROWS=131072
+Environment=PLE_THREADS=8
+EnvironmentFile=/etc/default/ple-rowserver
+
+# Flags as rowserverd parses them. The binary is what server/Makefile builds.
+ExecStart=/usr/local/bin/rowserverd \
+    --file ${PLE_TABLE} \
+    --base-row ${PLE_BASE_ROW} \
+    --row-count ${PLE_ROW_COUNT} \
+    --port ${PLE_PORT} \
+    --max-rows ${PLE_MAX_ROWS} \
+    --threads ${PLE_THREADS} \
+    --warm
+
+# rowserverd writes every log line to stderr and nothing to stdout, so this is what
+# lands in the journal: journalctl -u ple-rowserver
+SyslogIdentifier=rowserverd
+
+# The table is 23.842 GiB of clean page cache behind a read-only mmap. Clean file pages
+# cost nothing to reclaim and never reach swap, so these numbers bound a cache footprint
+# rather than gate an allocation.
+#
+# MemoryLow  protection against reclaim driven from outside this unit, so an image pull or
+#            a log rotation elsewhere on the box does not quietly evict the table. It is
+#            deliberately best-effort: when the node is genuinely out of memory the kernel
+#            breaches it rather than OOM-killing, which is how etcd keeps winning.
+#            MemoryMin would be the hard version of this and is exactly wrong here, since
+#            it converts memory pressure into an OOM kill somewhere else on the node.
+#            Set just above the table so the protection covers the mapping and nothing else.
+# MemoryHigh throttle and reclaim before the wall. At 25G there is 1.15 GiB of slack above
+#            the table, so reaching it means our anonymous memory grew, not that the table
+#            did. Treat it as a leak alarm.
+# MemoryMax  the wall. Hitting it reclaims our own clean file pages first, so the effect is
+#            major faults on the next gather, not a kill.
+MemoryAccounting=yes
+MemoryLow=24G
+MemoryHigh=25G
+MemoryMax=26G
+
+# The nodes run without swap, so this only matters if that ever changes: an anonymous
+# response buffer paged out would turn a 0.45 ms gather into a disk read.
+MemorySwapMax=0
+
+# mlock would make the table unreclaimable, which is the one way this service can take the
+# node down. Zero makes the attempt fail loudly instead of succeeding quietly.
+LimitMEMLOCK=0
+
+# Weight, not quota. CPUQuota enforces over a 100 ms period, so a burst past the quota parks
+# the process for the rest of that period, which is longer than a whole engine step. Weight
+# only matters when the CPU is actually contended and never inserts a stall of its own.
+CPUAccounting=yes
+CPUWeight=50
+
+# Our only disk traffic is refaulting evicted rows, which competes with etcd's WAL fsync on
+# the same device. Best effort: it needs the io controller enabled on the node.
+IOAccounting=yes
+IOWeight=50
+
+# If the node OOMs despite all of the above, be the process the kernel picks.
+OOMScoreAdjust=1000
+OOMPolicy=stop
+
+Restart=on-failure
+RestartSec=30s
+
+# Reads one file, writes to one socket and to the journal. Everything else is closed off.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# STAT counts resident pages with mincore(2), which is not in @system-service (checked with
+# systemd-analyze syscall-filter on systemd 255). Blocked, it would return EPERM and STAT
+# would report zero resident pages, which reads as a fully evicted table.
+SystemCallFilter=mincore
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

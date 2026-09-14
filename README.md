@@ -163,3 +163,48 @@ client side is a `PLE_MODE=remote` sibling to that repo's existing
 ## Licence
 
 Apache-2.0, matching vLLM and the repo above.
+
+## Phase 1 results (2026-09-14)
+
+Both halves served from peer RAM, measured from the inference box two switch hops away,
+against the staged-disk path the same box uses today.
+
+| workload | staged disk (chunk 8) | row server | speedup |
+|---|---|---|---|
+| decode, 512 rows | 7.679 ms | **0.611 ms** p50, 1.791 p99 | 12.6x |
+| prefill, 65,536 rows | 612.6 ms | **23.5 ms** | 26x |
+
+Correctness: eight probe rows fetched through the wire matched the original safetensors
+byte for byte, including both sides of the split boundary and a row inside one of the
+physically permuted shards.
+
+### Residency is the whole ballgame
+
+With node1 at 92% resident instead of 100%, the same decode gather took 6.3 ms rather
+than 0.6 ms, and prefill 172 ms rather than 20 ms. An 8% miss rate costs roughly 10x,
+because every missed row is a major fault on a random offset.
+
+The subtlety that caused it: **page cache is charged to the cgroup that first faults a
+page in**. Warming the file from a shell before starting the container left most of the
+mapping charged to `user.slice`, where the container's `memory.low` did not protect it,
+and it was reclaimed out from under the server. The container's own cgroup showed 8 GiB
+of file cache while the mapping was 22 GiB resident, and `memory.events` reported `low 0`,
+so the protection had never even been tested. Dropping the file from cache and letting the
+daemon fault it in itself moved the charge to the container and held 100%.
+
+So: never pre-warm the table outside the service that serves it.
+
+### Why the reads are interleaved
+
+Sending both peers' requests and then draining one peer to completion costs 37 ms on a
+prefill gather; draining both as bytes arrive costs 23.5 ms. Once a response outgrows the
+socket buffer the un-drained peer stalls on a full receive window, so the two peers
+serialise. A larger `SO_RCVBUF` does not fix it (38 ms); interleaving does.
+
+### What the chunk knob is not
+
+Raising the disk path's `QWEN4EXP_PLE_MMAP_CHUNK` from 8 looked like an easy win on the
+theory that the cost is syscall count. It is not: the cost is I/O latency and how much of
+the thread pool stays busy, so bigger chunks mean fewer work units. Decode went 7.7 ms at
+chunk 8, 5.1 at 16, 9.1 at 64 and 16.0 at 256. Prefill improved only 1.36x across that
+whole range. 16 is the best value and it is a small win, not a substitute for this project.
