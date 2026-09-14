@@ -41,9 +41,10 @@
 #define PROTO_VER   1u
 #define HDR_BYTES   16u
 #define STAT_BYTES  32u
+#define RECHG_BYTES 40u
 #define ROW_BYTES   160u          /* ple_embed_dim / ngram_heads = 2560 / 16, not config head_dim */
 
-enum { OP_GATHER = 1, OP_PING = 2, OP_STAT = 3 };
+enum { OP_GATHER = 1, OP_PING = 2, OP_STAT = 3, OP_RECHARGE = 4 };
 
 enum {
     ST_OK = 0,
@@ -51,7 +52,9 @@ enum {
     ST_BAD_OP = 2,
     ST_RANGE = 3,
     ST_TOO_MANY = 4,
-    ST_INTERNAL = 5
+    ST_INTERNAL = 5,
+    ST_BAD_PARAM = 6,
+    ST_BUSY = 7
 };
 
 enum { RD_OK = 0, RD_EOF = 1, RD_ERR = 2, RD_TIMEOUT = 3 };
@@ -63,6 +66,20 @@ enum { RD_OK = 0, RD_EOF = 1, RD_ERR = 2, RD_TIMEOUT = 3 };
 #define MAX_THREADS       256
 #define WARM_CHUNK        (64u << 20)
 #define MINCORE_PAGES     (1u << 15)  /* 32 KiB of vector per call */
+
+/* RECHARGE knobs. The slice is how much of the table is out of cache at any one
+ * moment, so it trades how long a racing gather can take a major fault against
+ * how many syscalls the sweep costs. A gather that lands in the slice in flight
+ * waits for one 4 KiB read, not for the slice. The cap is there so a client
+ * cannot ask for a quarter of the half at a time. */
+#define RECHARGE_SLICE_MIB      1024u
+#define RECHARGE_MAX_SLICE_MIB  4096u
+
+/* A whole half is 23.8 GiB read back from NVMe, which is well under a minute on
+ * these nodes. Ten times that means the disk is not behaving, and a sweep that
+ * runs for hours holds a connection slot and keeps the device busy next to
+ * etcd's WAL, so it stops and says how far it got. */
+#define RECHARGE_MAX_SECS       600
 
 /* Long enough that no legitimate gather comes near it: a full max_rows reply is
  * 21 MB, which is under a second of 2.5 GbE. */
@@ -86,7 +103,20 @@ struct server {
     uint32_t base32;        /* as the gather loop checks it, ids being u32 on the wire */
     uint32_t rows32;
     uint32_t max_rows;
+    int fd;                 /* the table, kept open for RECHARGE's posix_fadvise */
     int threads;
+};
+
+/* What a RECHARGE sweep reports back. Resident counts are for the whole mapping,
+ * so before and after answer the only question that matters: did it work. */
+struct recharge_report {
+    uint64_t pages_before;
+    uint64_t pages_after;
+    uint64_t pages_recharged;
+    uint32_t slices_done;
+    uint32_t slices_total;
+    uint32_t slice_pages;
+    uint32_t elapsed_ms;
 };
 
 struct conn {
@@ -200,6 +230,11 @@ static void log_capped(struct ratelimit *rl, const char *fmt, ...)
 
 /* The wire is little-endian whatever the host is. Shifts say so explicitly and
  * compile down to a plain load on the machines this runs on. */
+static inline uint16_t rd_u16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
 static inline uint32_t rd_u32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -279,6 +314,17 @@ static int drain(int fd, uint8_t *scratch, size_t scratch_len, uint64_t bytes)
 
 /* ------------------------------------------------------------------- table */
 
+static uint64_t elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+    int64_t ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ms = (int64_t)(now.tv_sec - since->tv_sec) * 1000 +
+         (now.tv_nsec - since->tv_nsec) / 1000000;
+    return ms > 0 ? (uint64_t)ms : 0;
+}
+
 static uint64_t resident_pages(const struct server *s)
 {
     static unsigned char vec[MINCORE_PAGES];
@@ -307,33 +353,55 @@ static uint64_t resident_pages(const struct server *s)
     return resident;
 }
 
-static void warm_map(const struct server *s)
+/* Fault [off, off + len) in through the mapping, one page touched per page, so the
+ * pages end up charged to this process's cgroup. off has to be page aligned for the
+ * readahead hint to be accepted.
+ *
+ * Readahead has to be turned back on for the duration. Once serving starts the mapping
+ * carries MADV_RANDOM, and MADV_WILLNEED does NOT override it: force_page_cache_ra caps
+ * a WILLNEED on a random-hinted VMA at the device's io_pages, so the loop degrades to one
+ * synchronous page-sized read per page. Measured at roughly 10x slower than the same touch
+ * over a VM_NORMAL mapping on the same file and disk. MADV_NORMAL first, MADV_RANDOM back
+ * afterwards, so the serving path keeps the hint it wants. */
+static void touch_range(const struct server *s, size_t off, size_t len)
 {
     static volatile uint64_t sink;   /* the touch loop has no other observable effect */
-    struct timespec t0, t1;
-    double secs;
-    size_t off;
+    size_t end = off + len;
+    size_t pos;
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (s->map_len > 0)
-        madvise(s->map, s->map_len < WARM_CHUNK ? s->map_len : WARM_CHUNK, MADV_WILLNEED);
+    if (len == 0)
+        return;
+    madvise(s->map + off, len, MADV_NORMAL);
+    madvise(s->map + off, len < WARM_CHUNK ? len : WARM_CHUNK, MADV_WILLNEED);
 
-    for (off = 0; off < s->map_len; off += WARM_CHUNK) {
-        size_t len = s->map_len - off < WARM_CHUNK ? s->map_len - off : WARM_CHUNK;
-        size_t next = off + WARM_CHUNK;
+    for (pos = off; pos < end; pos += WARM_CHUNK) {
+        size_t chunk = end - pos < WARM_CHUNK ? end - pos : WARM_CHUNK;
+        size_t next = pos + WARM_CHUNK;
         uint64_t acc = 0;
         size_t p;
 
         /* Advise one chunk ahead so the readahead for the next chunk is already in
          * flight while this one is being faulted in. */
-        if (next < s->map_len) {
-            size_t nlen = s->map_len - next < WARM_CHUNK ? s->map_len - next : WARM_CHUNK;
+        if (next < end) {
+            size_t nlen = end - next < WARM_CHUNK ? end - next : WARM_CHUNK;
             madvise(s->map + next, nlen, MADV_WILLNEED);
         }
-        for (p = 0; p < len; p += s->page_size)
-            acc += s->map[off + p];
+        for (p = 0; p < chunk; p += s->page_size)
+            acc += s->map[pos + p];
         sink += acc;
     }
+    /* Back to the hint the gather path wants. Harmless at startup, where main sets it
+     * again once warming is done. */
+    madvise(s->map + off, len, MADV_RANDOM);
+}
+
+static void warm_map(const struct server *s)
+{
+    struct timespec t0, t1;
+    double secs;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    touch_range(s, 0, s->map_len);
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
@@ -350,6 +418,109 @@ static void report_residency(const struct server *s)
     log_line("resident: %" PRIu64 " / %" PRIu64 " pages (%.2f GiB, %.1f%%)",
              pages, total, (double)pages * (double)s->page_size / 1073741824.0,
              total ? 100.0 * (double)pages / (double)total : 0.0);
+}
+
+/* Move the table's page cache onto this daemon's own cgroup, one slice at a time,
+ * without a restart.
+ *
+ * The kernel charges a file page to the cgroup that first faults it in. A table
+ * warmed from a shell before the daemon started belongs to that shell's slice,
+ * where the server's memory.low protects nothing, and the kernel then reclaims the
+ * table out from under a server still reporting a healthy residency. Measured on
+ * node2: 0 GiB charged to the container against 30 GiB to user.slice, residency
+ * drifting to 96.5%, 57,799 major faults against node1's 1,097, gathers 10x slower.
+ *
+ * The order of the three steps is the whole point. posix_fadvise cannot evict a
+ * page this process has mapped, which is why dropping the cache from outside the
+ * daemon is a no-op for exactly the pages that need moving. So the PTEs go first,
+ * the eviction then succeeds, and the touch faults the slice back in through our
+ * own mapping, which is what moves the charge.
+ *
+ * Nothing is locked. The mapping's address and length never change, so a gather
+ * racing this either finds the page still mapped or takes a fault that resolves to
+ * the same file offset; either way it copies the same bytes. Its cost is one major
+ * fault if the row it wants is in the slice currently in flight, which is the price
+ * of not stalling every gather behind a sweep that runs for a minute.
+ */
+static int recharge_map(const struct server *s, uint32_t slice_mib, struct recharge_report *rep)
+{
+    static atomic_int sweeping;
+    struct timespec t0;
+    size_t slice_bytes, off;
+    const char *how;
+    int st = ST_OK;
+
+    if (slice_mib == 0)
+        slice_mib = RECHARGE_SLICE_MIB;
+    if (slice_mib > RECHARGE_MAX_SLICE_MIB) {
+        LOG_CAPPED("recharge: slice of %u MiB over the %u MiB limit",
+                   slice_mib, RECHARGE_MAX_SLICE_MIB);
+        return ST_BAD_PARAM;
+    }
+    /* Two sweeps at once would have twice as much of the table cold at a time and
+     * would fault each other's slices back in, so the second caller is turned away
+     * rather than queued behind a thread that holds its connection for minutes. */
+    if (atomic_exchange(&sweeping, 1)) {
+        LOG_CAPPED("recharge: already sweeping");
+        return ST_BUSY;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    slice_bytes = (size_t)slice_mib << 20;
+    memset(rep, 0, sizeof *rep);
+    rep->slice_pages = (uint32_t)(slice_bytes / s->page_size);
+    rep->slices_total = (uint32_t)((s->map_len + slice_bytes - 1) / slice_bytes);
+    rep->pages_before = resident_pages(s);
+
+    LOG_CAPPED("recharge: starting, %.2f GiB in %u slices of %u MiB, %" PRIu64
+               " pages resident", (double)s->map_len / 1073741824.0,
+               rep->slices_total, slice_mib, rep->pages_before);
+
+    for (off = 0; off < s->map_len; off += slice_bytes) {
+        size_t len = s->map_len - off < slice_bytes ? s->map_len - off : slice_bytes;
+        int err;
+
+        /* Checked between slices and nowhere else. A slice that has been dropped
+         * and then left untouched stays cold, which is the condition this op
+         * exists to fix, so every drop gets its touch. */
+        if (elapsed_ms(&t0) >= (uint64_t)RECHARGE_MAX_SECS * 1000)
+            break;
+
+        if (madvise(s->map + off, len, MADV_DONTNEED) != 0) {
+            /* Nothing has been dropped yet, so stopping here leaves the table as
+             * it was rather than partly cold. */
+            LOG_CAPPED("recharge: madvise(DONTNEED) at offset %zu: %s", off, strerror(errno));
+            st = ST_INTERNAL;
+            break;
+        }
+        err = posix_fadvise(s->fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
+        if (err != 0) {
+            /* The PTEs for this slice are gone, so it is touched back in before
+             * anything else. Leaving it cold would be worse than the failure. */
+            LOG_CAPPED("recharge: fadvise(DONTNEED) at offset %zu: %s", off, strerror(err));
+            touch_range(s, off, len);
+            st = ST_INTERNAL;
+            break;
+        }
+        touch_range(s, off, len);
+        rep->pages_recharged += (len + s->page_size - 1) / s->page_size;
+        rep->slices_done++;
+    }
+
+    rep->pages_after = resident_pages(s);
+    rep->elapsed_ms = (uint32_t)elapsed_ms(&t0);
+    atomic_store(&sweeping, 0);
+
+    if (st != ST_OK)
+        how = "failed";
+    else if (rep->slices_done < rep->slices_total)
+        how = "out of time";
+    else
+        how = "done";
+    LOG_CAPPED("recharge: %s, %u of %u slices, %" PRIu64 " -> %" PRIu64
+               " pages resident in %u ms", how, rep->slices_done, rep->slices_total,
+               rep->pages_before, rep->pages_after, rep->elapsed_ms);
+    return st;
 }
 
 /* ------------------------------------------------------------------ serving */
@@ -392,6 +563,17 @@ static void fill_stat(const struct server *s, uint8_t *body)
     wr_u32(body + 16, ROW_BYTES);
     wr_u32(body + 20, pages > UINT32_MAX ? UINT32_MAX : (uint32_t)pages);
     wr_u64(body + 24, atomic_load_explicit(&served_requests, memory_order_relaxed));
+}
+
+static void fill_recharge(const struct recharge_report *rep, uint8_t *body)
+{
+    wr_u64(body, rep->pages_before);
+    wr_u64(body + 8, rep->pages_after);
+    wr_u64(body + 16, rep->pages_recharged);
+    wr_u32(body + 24, rep->slices_done);
+    wr_u32(body + 28, rep->slices_total);
+    wr_u32(body + 32, rep->slice_pages);
+    wr_u32(body + 36, rep->elapsed_ms);
 }
 
 static void *serve_conn(void *arg)
@@ -481,10 +663,10 @@ static void *serve_conn(void *arg)
             continue;
         }
 
-        /* PING and STAT carry no ids, but draining whatever count claims keeps a
-         * confused client's stream in sync instead of failing the next request.
-         * Past the drain limit there is no way back to a header boundary, so this
-         * answers the way GATHER does and then goes. */
+        /* PING, STAT and RECHARGE carry no ids, but draining whatever count claims
+         * keeps a confused client's stream in sync instead of failing the next
+         * request. Past the drain limit there is no way back to a header boundary,
+         * so this answers the way GATHER does and then goes. */
         if (count > 0 && drain(c.fd, ids, (size_t)s->max_rows * 4, (uint64_t)count * 4) != 0) {
             send_response(c.fd, resp, req_id, ST_TOO_MANY, 0, 0);
             break;
@@ -496,6 +678,20 @@ static void *serve_conn(void *arg)
         } else if (op == OP_STAT) {
             fill_stat(s, resp + HDR_BYTES);
             if (send_response(c.fd, resp, req_id, ST_OK, 0, STAT_BYTES) != 0)
+                break;
+        } else if (op == OP_RECHARGE) {
+            /* The slice size rides in the two header bytes every other op keeps at
+             * zero, so a RECHARGE is still a bare 16 byte request. */
+            struct recharge_report rep;
+            int rst = recharge_map(s, rd_u16(hdr + 6), &rep);
+
+            if (rst != ST_OK) {
+                if (send_response(c.fd, resp, req_id, (uint32_t)rst, 0, 0) != 0)
+                    break;
+                continue;
+            }
+            fill_recharge(&rep, resp + HDR_BYTES);
+            if (send_response(c.fd, resp, req_id, ST_OK, 0, RECHG_BYTES) != 0)
                 break;
         } else {
             LOG_CAPPED("unknown op %u", op);
@@ -728,11 +924,15 @@ int main(int argc, char **argv)
 
     s.map_len = (size_t)st.st_size;
     s.map = mmap(NULL, s.map_len, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
     if (s.map == MAP_FAILED) {
         log_line("mmap %s: %s", path, strerror(errno));
+        close(fd);
         return 1;
     }
+    /* The descriptor stays open for RECHARGE, whose posix_fadvise needs one. Opening
+     * the path again later could find a different file, and inside the container the
+     * bind mount is the only way back to this inode anyway. */
+    s.fd = fd;
     s.page_size = (size_t)sysconf(_SC_PAGESIZE);
     s.base_row = base_row;
     s.row_count = row_count;
