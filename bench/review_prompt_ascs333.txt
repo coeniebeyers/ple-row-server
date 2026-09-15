@@ -1,0 +1,30 @@
+Review pull request #333 of AdharaProjects/adhara-smart-contract-suite, "Bound `emergencyBurn` by
+available balance and add encumbrance override". The full PR branch is checked out in this directory;
+the base is origin/hackathon/202605, so `git diff origin/hackathon/202605...HEAD` is the change.
+
+Use MULTIPLE AGENTS working in parallel, one per lens, then a second adversarial round.
+
+Round one, in parallel, one agent each:
+  1. SECURITY. src/.../Facets/EmergencyActions/EmergencyActions.sol, IEmergencyActions.sol and
+     Libraries/LibIssuerManagerRoles.sol. This change bounds an emergency burn by available balance
+     and adds an override that can reach encumbered funds. Ask: who can call the override, is that
+     authority checked on every path, can the bound be evaded by ordering or re-entrancy, and can the
+     override burn more than intended or burn funds it should not reach. Encumbrances are meant to be
+     inviolable by emergency burn except through the explicit override, so anything that lets an
+     ordinary burn touch encumbered balance is a HIGH finding.
+  2. TESTS. test/.../EmergencyActions.t.sol and IssuerManagerFundingPayoutFlows.t.sol. Do the tests
+     actually exercise the new bound and the override, including the boundary where available balance
+     exactly equals the burn amount, and the case where the override is not authorised? Name what is
+     NOT covered as specifically as what is.
+  3. DOCS. docs/issuer-manager.md, docs/token-account.md and the new
+     docs/operational-guides/encumbered-burn-response.md. Does the documented procedure match what the
+     code actually does? A runbook that describes behaviour the code does not have is a real finding.
+  4. SCRIPTS. scripts/test-issuer-manager.sh, test-sandbox-gateway-api.sh, test-sandbox.sh. Check the
+     shell for quoting, error handling, and whether the changes match the contract changes.
+
+Round two, adversarial: take every finding from round one and RE-DERIVE it from the files. Quote
+file:line. Discard anything you cannot substantiate that way, and say plainly which findings you
+discarded and why. A short list of confirmed findings is far more useful than a long list of guesses.
+
+Report: severity, file:line, what breaks, and the concrete failure scenario. Separate CONFIRMED from
+UNCERTAIN. If you find nothing serious, say that clearly rather than padding the list.
