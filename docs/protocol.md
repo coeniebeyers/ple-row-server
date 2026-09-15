@@ -103,8 +103,27 @@ request header with the id array and add up to 40 ms, which is 40 engine steps
 worth of damage.
 
 Connections are long lived. The client opens one per server at load time and keeps
-it. There is no reconnect logic in the hot path: if a connection breaks the gather
-fails loudly rather than silently stalling a forward pass while it retries.
+it for the life of the model.
+
+A connection that breaks is replaced rather than mourned. The client reconnects the
+affected server and reissues the gather a small bounded number of times before it
+gives up, because the alternative, which is what it did until 2026-09-15, is that a
+sub-minute network disturbance kills the engine and costs a nine to thirteen minute
+model reload.
+
+The rule the retry has to obey comes out of the framing: **a connection that failed
+part way through a response can never be used again**. There is no resynchronisation
+point in this protocol, so bytes left unread on a socket would be read as the answer
+to whatever is sent next, and since a gather response is nothing but row data that
+would deserialise cleanly into embeddings for the wrong ids. So the socket is closed
+and a new one opened before anything is reissued, and the reissue carries a fresh
+`req_id` that the client checks on the way back.
+
+Server rejections are the other half of the rule. A non-zero status leaves the
+connection in sync and means the request or the deployment is wrong, so the client
+treats statuses 1 to 4 as fatal and does not retry them. A `req_id` that does not
+echo is fatal too, and for a stronger reason: at that point the client does not know
+what it is holding, and no further reads would tell it.
 
 ## Recharging the page cache
 

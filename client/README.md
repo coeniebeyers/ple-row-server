@@ -42,8 +42,10 @@ win over the environment.
 | `PLE_REMOTE_PEERS` | `node1:9000,node2:9000` | comma separated `host:port` list, any number of peers |
 | `PLE_REMOTE_ROWS` | `320001536` | rows the peers must add up to; the load-time coverage assertion |
 | `PLE_REMOTE_MAX_ROWS` | `131072` | per request row cap, has to match the servers |
-| `PLE_REMOTE_TIMEOUT` | `10.0` | socket timeout in seconds, once connected |
-| `PLE_REMOTE_CONNECT_TIMEOUT` | `5.0` | connect timeout in seconds |
+| `PLE_REMOTE_TIMEOUT` | `30.0` | socket timeout in seconds, once connected; what decides a peer has gone quiet |
+| `PLE_REMOTE_CONNECT_TIMEOUT` | `5.0` | connect timeout in seconds, per attempt |
+| `PLE_REMOTE_CONNECT_DEADLINE` | `60.0` | at construction, how long to keep retrying a peer that is not up yet |
+| `PLE_REMOTE_GATHER_DEADLINE` | `120.0` | wall clock for one whole gather, reissues and reconnects included |
 
 ## What a gather does
 
@@ -56,12 +58,15 @@ two. Duplicate ids stay duplicates, in request order, as the protocol says.
 Buffers are grown on demand and kept, so a steady state gather allocates nothing beyond the
 mask and index arrays. The partition runs to completion before any bytes hit a socket: an
 out of range id or a request above `max_rows` raises with nothing sent, which leaves the
-connections usable. Anything that fails *after* a request has gone out marks the whole table
-unusable, because unread responses are still queued on at least one socket and the next
-gather would read them as its own.
+connections usable.
 
-There is no retry anywhere. A gather sits inside a forward pass, so it fails loudly instead
-of stalling the engine while it hopes.
+A transport fault after a request has gone out (a socket timeout, a reset, a peer closing
+mid-message) gets the unanswered peers reconnected and their requests reissued, three
+attempts in all, under one wall-clock deadline for the whole gather that every blocking
+call inside it is clamped to. A socket whose framing is in doubt is closed with an RST and
+never read again, so nothing left on it can be taken for the next answer. Protocol errors
+(a non-zero status, a `req_id` that does not echo) are never retried. A gather that outlasts
+the budget marks the whole table unusable, as before. See `docs/protocol.md`.
 
 ## Self-check
 
@@ -75,8 +80,8 @@ assertion can fire. No deployment and no model needed.
 
 ## What it does not do yet
 
-- **No reconnect.** One long-lived connection per peer, opened at construction. If one
-  breaks, the table object is finished and the process has to build a new one.
+- **No reconnect between gathers.** A connection is only replaced when a gather fails on
+  it. A table that gave up on a gather stays unusable and has to be rebuilt.
 - **No chunking above `max_rows`.** A request that would send more than `max_rows` rows to a
   single peer raises rather than splitting. A 4096 token prefill chunk is 65,536 rows across
   two peers, so the default leaves plenty of room, but a much larger batch would need the

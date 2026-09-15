@@ -11,6 +11,11 @@ TCP (see docs/protocol.md).
 Torch and numpy are the only imports that matter, so this can be driven from a
 benchmark script on a box with no vLLM on it.
 
+A gather runs inside every forward pass, so a transport fault mid-gather (a
+timeout, a reset, a peer closing on us) replaces the affected connections and
+reissues the request, under one wall-clock deadline for the whole gather.
+Protocol errors are never retried. See PLERemoteTable._exchange for the rules.
+
 Run the module directly for a self-check of ordering and duplicate handling
 against two loopback servers.
 """
@@ -22,6 +27,7 @@ import select
 import socket
 import struct
 import threading
+import time
 
 import numpy as np
 import torch
@@ -51,8 +57,21 @@ ROW_BYTES = 160
 DEFAULT_PEERS = "node1:9000,node2:9000"
 DEFAULT_PORT = 9000
 DEFAULT_MAX_ROWS = 131072
-DEFAULT_TIMEOUT = 10.0
+# The socket timeout is not a latency budget: a full max_rows reply is 21 MB,
+# under a second of 2.5 GbE, and nothing legitimate comes near either number.
+# It is what decides that a peer has gone, and on 2026-09-15 a disturbance of
+# about a minute that both peers sat out healthy tripped 10 s and took the
+# engine down with it. 30 s is the server's own socket timeout.
+DEFAULT_TIMEOUT = 30.0
 DEFAULT_CONNECT_TIMEOUT = 5.0
+# Startup only. The model load costs nine to thirteen minutes, so waiting a
+# minute for a peer that is not up yet is free next to failing and loading again.
+DEFAULT_CONNECT_DEADLINE = 60.0
+# One whole gather, reissues and reconnects included: the longest a forward
+# pass can be held, and so the longest disturbance survived. Sized so the
+# measured one, about 60 s, fits after the first socket timeout has been spent.
+DEFAULT_GATHER_DEADLINE = 120.0
+GATHER_ATTEMPTS = 3
 
 _STATUS = {
     1: "bad magic or version",
@@ -79,7 +98,12 @@ class _Peer:
     def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
+        self.addr: tuple = (host, port)
         self.sock: socket.socket | None = None
+        self.timeout = 0.0
+        self._armed = 0.0
+        self.deadline: float | None = None
+        self.answered = False
         self.base_row = 0
         self.row_count = 0
         self.row_bytes = 0
@@ -101,17 +125,53 @@ class _Peer:
         return f"{self.host}:{self.port}"
 
     def connect(self, connect_timeout: float, timeout: float) -> None:
-        sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
+        sock = socket.create_connection(self.addr, timeout=connect_timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(timeout)
         self.sock = sock
+        self.timeout = self._armed = timeout
+        # Reconnects go to the address the first connect resolved, so one made
+        # under a gather deadline never sits in the resolver, which no timeout
+        # here covers.
+        self.addr = sock.getpeername()[:2]
 
-    def close(self) -> None:
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            finally:
-                self.sock = None
+    def close(self, abort: bool = False) -> None:
+        """Drop the connection; abort makes it an RST rather than a FIN.
+
+        For a socket whose framing is in doubt: the peer stops sending at once,
+        and nothing it already sent can turn up as the answer to a later request.
+        """
+        sock, self.sock, self.pending = self.sock, None, None
+        if sock is None:
+            return
+        try:
+            if abort:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        finally:
+            sock.close()
+
+    def _arm(self) -> None:
+        """Clamp the socket timeout to what is left of the gather deadline, if one is set.
+
+        Before every recv and send, not once per request: the socket timeout
+        restarts on every byte, so alone it bounds the silence between bytes and
+        not the call. The cached value keeps the fcntl off the hot path.
+        """
+        budget = self.timeout
+        if self.deadline is not None:
+            budget = min(budget, self.deadline - time.monotonic())
+            if budget <= 0:
+                raise TimeoutError(f"PLE remote {self}: gather deadline passed")
+        if budget != self._armed:
+            self.sock.settimeout(budget)
+            self._armed = budget
+
+    def _recv(self, mv: memoryview, want: int) -> int:
+        self._arm()
+        try:
+            return self.sock.recv_into(mv, want)
+        except TimeoutError:
+            raise TimeoutError(f"PLE remote {self}: no data for {self._armed:.1f}s") from None
 
     def reserve(self, rows: int) -> None:
         """Grow the request and response buffers to hold `rows` rows."""
@@ -125,17 +185,19 @@ class _Peer:
         self.rows_mv = memoryview(self.rows).cast("B")
         self.cap = cap
 
-    def fail(self, what: str) -> None:
-        raise RuntimeError(f"PLE remote {self}: {what}")
+    def fail(self, what: str, exc: type[Exception] = RuntimeError) -> None:
+        raise exc(f"PLE remote {self}: {what}")
 
     def send_gather(self, req_id: int, count: int) -> None:
         """Send a GATHER for the ids already written into req_ids[:count]."""
         struct.pack_into("<IBBHII", self.req, 0, MAGIC_REQ, VERSION, OP_GATHER, 0, req_id, count)
+        self._arm()
         self.sock.sendall(self.req_mv[: HEADER + 4 * count])
         self.pending = req_id
 
     def send_bare(self, op: int, req_id: int) -> None:
         struct.pack_into("<IBBHII", self._hdr_out, 0, MAGIC_REQ, VERSION, op, 0, req_id, 0)
+        self._arm()
         self.sock.sendall(self._hdr_out)
         self.pending = req_id
 
@@ -162,11 +224,12 @@ class _Peer:
 
     def pump_rows(self) -> bool:
         """One recv into the pending body. True once it is complete."""
-        n = self.sock.recv_into(self._rd_mv[self._rd_got:], self._rd_want - self._rd_got)
+        n = self._recv(self._rd_mv[self._rd_got:], self._rd_want - self._rd_got)
         if not n:
-            self.fail(f"connection closed after {self._rd_got} of {self._rd_want} bytes")
+            self.fail(f"connection closed after {self._rd_got} of {self._rd_want} bytes", ConnectionError)
         self._rd_got += n
-        return self._rd_got >= self._rd_want
+        self.answered = self._rd_got >= self._rd_want
+        return self.answered
 
     def finish_rows(self) -> None:
         while self._rd_got < self._rd_want:
@@ -204,16 +267,20 @@ class _Peer:
         # with pending still set would make the next request look like a desync.
         self.pending = None
         if status:
-            self.fail(f"status {status} ({_STATUS.get(status, 'unknown status')})")
+            # Status 5 is sent only from the server's out-of-memory path at
+            # connection setup, after which it closes, so a fresh connection
+            # is worth a try. Every other status is a bug or a misconfiguration.
+            self.fail(f"status {status} ({_STATUS.get(status, 'unknown status')})",
+                      ConnectionError if status == 5 else RuntimeError)
         return count
 
     def _recv_exact(self, mv: memoryview) -> None:
         want = len(mv)
         got = 0
         while got < want:
-            n = self.sock.recv_into(mv[got:], want - got)
+            n = self._recv(mv[got:], want - got)
             if not n:
-                self.fail(f"connection closed after {got} of {want} bytes")
+                self.fail(f"connection closed after {got} of {want} bytes", ConnectionError)
             got += n
 
 
@@ -238,6 +305,8 @@ class PLERemoteTable:
         max_rows: int | None = None,
         timeout: float | None = None,
         connect_timeout: float | None = None,
+        connect_deadline: float | None = None,
+        gather_deadline: float | None = None,
     ) -> None:
         # model_dir and threads exist so this can stand in for PLEMmapTable
         # unchanged. Nothing here reads the checkpoint, and the concurrency is
@@ -253,6 +322,12 @@ class PLERemoteTable:
         self.connect_timeout = float(
             connect_timeout if connect_timeout is not None else _env("CONNECT_TIMEOUT", str(DEFAULT_CONNECT_TIMEOUT))
         )
+        self.connect_deadline = float(
+            connect_deadline if connect_deadline is not None else _env("CONNECT_DEADLINE", str(DEFAULT_CONNECT_DEADLINE))
+        )
+        self.gather_deadline = float(
+            gather_deadline if gather_deadline is not None else _env("GATHER_DEADLINE", str(DEFAULT_GATHER_DEADLINE))
+        )
         self.peers = _parse_peers(peers if peers is not None else _env("PEERS", DEFAULT_PEERS))
 
         self._lock = threading.Lock()
@@ -266,8 +341,9 @@ class PLERemoteTable:
         self._mask_b = np.empty(0, dtype=bool)
 
         try:
+            deadline = time.monotonic() + self.connect_deadline
             for peer in self.peers:
-                peer.connect(self.connect_timeout, self.timeout)
+                self._connect(peer, deadline)
                 self._apply_stat(peer, peer.query_stat(self._next_req_id()))
             self._check_split()
         except Exception:
@@ -285,6 +361,36 @@ class PLERemoteTable:
         logger.info("PLE remote table: %s", self.describe())
 
     # ------------------------------------------------------------ connect
+    def _connect(self, peer: _Peer, deadline: float) -> None:
+        """Connect peer, retrying with backoff until deadline, and say so in the log."""
+        pause = 0.5
+        while True:
+            left = deadline - time.monotonic()
+            try:
+                peer.connect(min(self.connect_timeout, max(left, 0.001)), self.timeout)
+                return
+            except OSError as exc:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError(f"PLE remote {peer}: still unreachable at the deadline ({exc})") from exc
+                logger.warning("PLE remote %s: connect failed (%s), retrying for up to %.0fs more", peer, exc, left)
+                time.sleep(min(pause, left))
+                pause = min(pause * 2, 5.0)
+
+    def _check_range(self, peer: _Peer, stat: dict) -> None:
+        """A peer whose range moved would serve the right shaped bytes for the wrong ids."""
+        if (stat["base_row"], stat["row_count"], stat["row_bytes"]) != (
+            peer.base_row,
+            peer.row_count,
+            peer.row_bytes,
+        ):
+            raise RuntimeError(
+                f"PLE remote: {peer} changed its range under us: "
+                f"{peer.base_row:,}+{peer.row_count:,} -> {stat['base_row']:,}+{stat['row_count']:,}"
+            )
+        peer.resident_pages = stat["resident_pages"]
+        peer.served_requests = stat["served_requests"]
+
     def _apply_stat(self, peer: _Peer, stat: dict) -> None:
         peer.base_row = stat["base_row"]
         peer.row_count = stat["row_count"]
@@ -405,6 +511,7 @@ class PLERemoteTable:
                 self._raise_unroutable(ids_np, n)
             try:
                 take = self._take
+                active = []
                 for peer, sel in zip(self.peers, self._sel):
                     k = sel.size
                     if not k:
@@ -412,33 +519,91 @@ class PLERemoteTable:
                     peer.reserve(k)
                     np.take(ids_np, sel, out=take[:k])
                     np.copyto(peer.req_ids[:k], take[:k], casting="unsafe")
-                    peer.send_gather(self._next_req_id(), k)
-                active = [(peer, sel) for peer, sel in zip(self.peers, self._sel) if sel.size]
-                for peer, sel in active:
-                    peer.begin_rows(sel.size)
-                if len(active) > 1:
-                    self._drain(peer for peer, _ in active)
-                else:
-                    for peer, _ in active:
-                        peer.finish_rows()
+                    active.append((peer, sel))
+                self._exchange(active)
                 rows = self._staging_np[:n]
                 for peer, sel in active:
                     rows[sel] = peer.rows[: sel.size]
             except Exception as exc:
-                # Anything that lands here leaves unread responses queued on at
-                # least one socket, so the whole table goes with it.
+                # A protocol error is a bug or a misconfiguration, and a
+                # transport fault that outlasted the retry budget has left at
+                # least one socket out of sync. Either way the whole table goes.
                 self._failed = f"{type(exc).__name__}: {exc}"
                 raise
         return out
 
-    def _drain(self, peers) -> None:
+    def _exchange(self, active: list[tuple[_Peer, np.ndarray]]) -> None:
+        """Send every peer its request and read every answer, reissuing on a transport fault.
+
+        A timeout, a reset or a peer closing mid-message gets the unanswered
+        requests sent again on fresh connections, up to GATHER_ATTEMPTS times.
+        Which peers are reissued is decided by which have not finished reading
+        their answer, not by which one raised: with two responses in flight
+        the other socket is just as much in doubt, and a socket in doubt is
+        closed with an RST and never read again, because bytes left on it
+        would be taken for the reply to whatever is sent next. Reconnecting is
+        part of the next attempt, so a fault there costs an attempt and not the
+        gather, and the reconnected peer is asked for STAT again so one that
+        came back with a different range is refused.
+
+        The deadline is enforced inside the reads, not between attempts: every
+        blocking call in here gets at most what is left of it, the select in
+        _drain, each recv and send through _Peer._arm, and the connect and the
+        pause before it in _connect. So a gather returns or raises within
+        gather_deadline of starting, plus the scheduler's latency in waking
+        the one call that was pending when it ran out. Attempts alone could
+        not promise that, because the socket timeout restarts on every byte
+        and a peer trickling one byte per timeout would never trip it.
+        """
+        start = time.monotonic()
+        deadline = start + self.gather_deadline
+        for peer, _ in active:
+            peer.deadline = deadline
+        todo = active
+        try:
+            for attempt in range(1, GATHER_ATTEMPTS + 1):
+                try:
+                    for peer, _ in todo:
+                        peer.answered = False
+                        if peer.sock is None:
+                            self._connect(peer, deadline)
+                            self._check_range(peer, peer.query_stat(self._next_req_id()))
+                    for peer, sel in todo:
+                        peer.send_gather(self._next_req_id(), sel.size)
+                    for peer, sel in todo:
+                        peer.begin_rows(sel.size)
+                    if len(todo) > 1:
+                        self._drain([peer for peer, _ in todo], deadline)
+                    else:
+                        todo[0][0].finish_rows()
+                    if attempt > 1:
+                        logger.warning("PLE remote: gather recovered on attempt %d, %.1fs in", attempt, time.monotonic() - start)
+                    return
+                except OSError as exc:
+                    todo = [(peer, sel) for peer, sel in todo if not peer.answered]
+                    for peer, _ in todo:
+                        peer.close(abort=True)
+                    if attempt == GATHER_ATTEMPTS or time.monotonic() >= deadline:
+                        raise
+                    logger.warning(
+                        "PLE remote: gather attempt %d failed, %s: %s; reconnecting %s",
+                        attempt, type(exc).__name__, exc, ", ".join(str(peer) for peer, _ in todo),
+                    )
+        finally:
+            for peer, _ in active:
+                peer.deadline = None
+
+    def _drain(self, peers: list[_Peer], deadline: float) -> None:
         """Read every peer's body as its bytes arrive, rather than one peer at a time."""
         waiting = {peer.sock: peer for peer in peers}
         while waiting:
-            ready, _, _ = select.select(list(waiting), [], [], self.timeout)
+            wait = min(self.timeout, deadline - time.monotonic())
+            ready = select.select(list(waiting), [], [], wait)[0] if wait > 0 else []
             if not ready:
-                raise RuntimeError(
-                    f"PLE remote: no response from {len(waiting)} peer(s) in {self.timeout}s"
+                names = ", ".join(str(peer) for peer in waiting.values())
+                raise TimeoutError(
+                    f"PLE remote: no data from {names} for {wait:.1f}s" if wait > 0
+                    else f"PLE remote: gather deadline passed with {names} unanswered"
                 )
             for sock in ready:
                 if waiting[sock].pump_rows():
@@ -505,17 +670,7 @@ class PLERemoteTable:
                 self._failed = f"{type(exc).__name__}: {exc}"
                 raise
             for peer, stat in zip(self.peers, stats):
-                if (stat["base_row"], stat["row_count"], stat["row_bytes"]) != (
-                    peer.base_row,
-                    peer.row_count,
-                    peer.row_bytes,
-                ):
-                    raise RuntimeError(
-                        f"PLE remote: {peer} changed its range under us: "
-                        f"{peer.base_row:,}+{peer.row_count:,} -> {stat['base_row']:,}+{stat['row_count']:,}"
-                    )
-                peer.resident_pages = stat["resident_pages"]
-                peer.served_requests = stat["served_requests"]
+                self._check_range(peer, stat)
         return stats
 
     def close(self) -> None:
